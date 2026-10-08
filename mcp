@@ -1,0 +1,196 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ============================================================================
+# termux-mcp 控制脚本 —— 管理 Termux 本地 MCP (Model Context Protocol) 服务器
+#
+# 用法:
+#   mcp on      启动 MCP 服务器（后台运行，不阻塞当前 shell）
+#   mcp off     停止 MCP 服务器
+#   mcp status  查看运行状态（无参数时默认执行）
+#   mcp help    显示帮助
+#
+# 环境变量:
+#   MCP_PORT    监听端口，默认 8000
+#   MCP_TOKEN   可选 Bearer 认证令牌（修改后需 off/on 重启生效）
+#
+# 文件布局:
+#   $PREFIX/bin/mcp                     本脚本
+#   $PREFIX/share/termux-mcp/server.py  MCP 服务器（python3）
+#   $PREFIX/var/run/mcp.pid             PID 文件（第1行 PID，第2行 端口）
+#   $PREFIX/var/log/mcp.log             服务日志
+# ============================================================================
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+SHARE_DIR="$PREFIX/share/termux-mcp"
+SERVER="$SHARE_DIR/server.py"
+RUN_DIR="$PREFIX/var/run"
+LOG_DIR="$PREFIX/var/log"
+PID_FILE="$RUN_DIR/mcp.pid"
+LOG_FILE="$LOG_DIR/mcp.log"
+PORT="${MCP_PORT:-8000}"
+
+# ---------- 输出辅助（非终端时自动去色） ----------
+if [ -t 1 ]; then
+    C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_0=$'\033[0m'
+else
+    C_G=''; C_R=''; C_Y=''; C_0=''
+fi
+ok()   { printf '%s\n' "${C_G}$*${C_0}"; }
+warn() { printf '%s\n' "${C_Y}$*${C_0}"; }
+err()  { printf '%s\n' "${C_R}$*${C_0}" >&2; }
+
+# ---------- PID 文件读写 ----------
+read_pid()  { [ -f "$PID_FILE" ] && head -n 1 "$PID_FILE" 2>/dev/null; }
+read_port() {
+    local p=""
+    [ -f "$PID_FILE" ] && p=$(sed -n '2p' "$PID_FILE" 2>/dev/null)
+    echo "${p:-$PORT}"
+}
+
+# 判断服务是否在运行；发现陈旧 PID 文件时自动清理。
+# 除 kill -0 探活外，还核对 /proc/PID/cmdline 含 server.py，防止 PID 复用误判。
+is_running() {
+    local pid cmdline
+    pid=$(read_pid)
+    case "$pid" in
+        ''|*[!0-9]*) rm -f "$PID_FILE"; return 1 ;;
+    esac
+    cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
+    if kill -0 "$pid" 2>/dev/null; then
+        case "$cmdline" in
+            *server.py*) return 0 ;;
+        esac
+    fi
+    rm -f "$PID_FILE"      # 进程已死或非本服务 → 陈旧文件，清理
+    return 1
+}
+
+# ---------- 子命令 ----------
+cmd_on() {
+    if is_running; then
+        local pid running_port
+        pid=$(read_pid); running_port=$(read_port)
+        warn "MCP 服务已在运行 (PID $pid)，地址 http://127.0.0.1:$running_port/mcp"
+        python3 "$SERVER" --print-status --port "$running_port" 2>/dev/null \
+            || echo "  地址: http://127.0.0.1:$running_port/mcp"
+        return 0
+    fi
+
+    # 依赖检查：python3 是唯一运行依赖
+    if ! command -v python3 >/dev/null 2>&1; then
+        err "错误: 未找到 python3，请先安装:"
+        echo  "  pkg install python" >&2
+        return 1
+    fi
+    if [ ! -f "$SERVER" ]; then
+        err "错误: 缺少服务器文件 $SERVER"
+        echo  "  请重新运行 termux-mcp 的 install.sh" >&2
+        return 1
+    fi
+
+    mkdir -p "$RUN_DIR" "$LOG_DIR" || { err "错误: 无法创建运行目录"; return 1; }
+
+    # 后台启动：nohup 脱离终端作业控制，输出追加到日志文件
+    MCP_PORT="$PORT" MCP_TOKEN="${MCP_TOKEN:-}" \
+        nohup python3 "$SERVER" >>"$LOG_FILE" 2>&1 &
+    local pid=$!
+    printf '%s\n%s\n' "$pid" "$PORT" >"$PID_FILE"
+
+    # 就绪探测：最多等 5 秒（server.py --probe 轮询 GET /）
+    if python3 "$SERVER" --probe --port "$PORT" --timeout 5; then
+        ok "MCP 服务已启动 (PID $pid)"
+        python3 "$SERVER" --print-status --port "$PORT" || true
+        echo
+        echo "AI 客户端连接配置（Streamable HTTP，无状态）:"
+        cat <<EOF
+    {
+      "mcpServers": {
+        "termux": {
+          "url": "http://127.0.0.1:$PORT/mcp"
+        }
+      }
+    }
+EOF
+        [ -n "${MCP_TOKEN:-}" ] && \
+            echo "  注意: 已启用 Bearer 认证，客户端还需配置 headers.Authorization = \"Bearer <MCP_TOKEN>\""
+        echo
+        echo "日志: $LOG_FILE    (tail -f 可实时查看)"
+        echo "停止: mcp off"
+    else
+        err "服务启动失败（http://127.0.0.1:$PORT/ 无响应），日志尾部:"
+        tail -n 20 "$LOG_FILE" >&2 2>/dev/null || true
+        # 启动失败则不留半死进程与脏 PID 文件
+        kill "$pid" 2>/dev/null
+        rm -f "$PID_FILE"
+        return 1
+    fi
+}
+
+cmd_off() {
+    if ! is_running; then
+        warn "MCP 服务未在运行"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    local pid i
+    pid=$(read_pid)
+    echo "正在停止 MCP 服务 (PID $pid)..."
+    kill -TERM "$pid" 2>/dev/null          # 优雅停止（触发服务端 SIGTERM 清理）
+    for i in $(seq 1 25); do               # 最多等 5 秒
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        warn "优雅停止超时，强制终止"
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    rm -f "$PID_FILE"
+    ok "MCP 服务已停止"
+}
+
+cmd_status() {
+    if is_running; then
+        local pid running_port
+        pid=$(read_pid); running_port=$(read_port)
+        ok "MCP 服务运行中 (PID $pid)"
+        python3 "$SERVER" --print-status --port "$running_port" 2>/dev/null \
+            || echo "  地址: http://127.0.0.1:$running_port/mcp"
+    else
+        warn "MCP 服务已停止 (执行 mcp on 启动)"
+    fi
+    echo
+    show_help
+}
+
+show_help() {
+    cat <<EOF
+用法: mcp <命令>
+
+命令:
+  on        启动本地 MCP 服务器（后台运行）
+  off       停止 MCP 服务器
+  status    查看运行状态（无参数时默认）
+  help      显示本帮助
+
+环境变量:
+  MCP_PORT   监听端口 (默认 8000)
+  MCP_TOKEN  Bearer 认证令牌 (可选，修改后需重启)
+
+相关文件:
+  服务端   $SERVER
+  PID 文件 $PID_FILE
+  日志     $LOG_FILE
+EOF
+}
+
+# ---------- 入口 ----------
+case "${1:-status}" in
+    on)              cmd_on ;;
+    off)             cmd_off ;;
+    status|"")       cmd_status ;;
+    help|-h|--help)  show_help ;;
+    *)
+        err "未知子命令: $1"
+        show_help
+        exit 1
+        ;;
+esac
