@@ -1,0 +1,9 @@
+# 打包产物
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
