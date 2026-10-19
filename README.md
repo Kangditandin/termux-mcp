@@ -6,6 +6,8 @@
 >
 > 纯 Python 标准库实现，**零第三方依赖**，只监听 `127.0.0.1`，不暴露到外网。
 
+**Keywords:** `termux mcp` · `android mcp server` · `android ai agent` · `model context protocol` · `llm control phone` · `termux automation` · `android shell mcp` · `claude/gpt agent on android`
+
 ---
 
 ## 目录
